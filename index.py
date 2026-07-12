@@ -9,6 +9,15 @@ from tkinter import messagebox, simpledialog
 import threading
 from PIL import Image, ImageTk
 
+try:
+    import pydirectinput
+    pydirectinput.PAUSE = 0.01
+    pydirectinput.FAILSAFE = False
+    HAS_PYDIRECTINPUT = True
+except ImportError:
+    pydirectinput = None
+    HAS_PYDIRECTINPUT = False
+
 # Windows DPI 인식
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -20,8 +29,17 @@ except Exception:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
-MINT_TEMPLATE_PATH = os.path.join(TEMPLATE_DIR, "mint.png")
+MINT_LONG_PATH = os.path.join(TEMPLATE_DIR, "mint_long.png")
+MINT_SHORT_PATH = os.path.join(TEMPLATE_DIR, "mint_short.png")
+MINT_LEGACY_PATH = os.path.join(TEMPLATE_DIR, "mint.png")  # 하위호환
 YELLOW_TEMPLATE_PATH = os.path.join(TEMPLATE_DIR, "yellow.png")
+
+TEMPLATE_SAVE_PATHS = {
+    "mint_long": MINT_LONG_PATH,
+    "mint_short": MINT_SHORT_PATH,
+    "mint": MINT_LEGACY_PATH,
+    "yellow": YELLOW_TEMPLATE_PATH,
+}
 
 # 전역 변수
 is_running = False
@@ -37,24 +55,34 @@ last_mint_score = 0.0
 last_yellow_score = 0.0
 last_mint_box = None  # (x, y, w, h)
 last_yellow_box = None
+last_mint_name = None  # 매칭된 템플릿 파일명
 PREVIEW_MAX_WIDTH = 520
 FISH_GONE_FRAMES = 15
 match_threshold = 0.70
 
-mint_template = None  # BGR
-yellow_template = None
+mint_templates = []  # [(filename, bgr), ...] 긴/짧은 등
+yellow_templates = []
 
 algorithm_steps = []
 current_step_index = None
 algo_status_text = "대기"
 
+# 실행 대상 창
+target_hwnd = None
+target_window_title = ""
+target_process_name = ""
+_last_ensure_fg = 0.0
+bot_topmost_default = True
+bot_withdrawn = False
+
 user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
 _prev_mouse_buttons = {"left": False, "right": False, "middle": False}
 _last_click_text = "클릭 없음"
 _last_click_expire = 0.0
 _key_down_state = {"a": False, "d": False}
 
-# --- SendInput 상수/구조체 ---
+# --- SendInput / 메시지 상수 ---
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -70,6 +98,17 @@ SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
 MAPVK_VK_TO_VSC = 0
+SW_RESTORE = 9
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+MK_LBUTTON = 0x0001
+
+EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
 # 키 이름 -> 가상키
 VK_MAP = {
@@ -171,30 +210,352 @@ def _make_key_input(vk, key_up=False):
     return inp
 
 
+def _key_lparam(vk, key_up=False):
+    scan = _vk_to_scan(vk)
+    lp = 1 | (scan << 16)
+    if _is_extended_vk(vk):
+        lp |= 1 << 24
+    if key_up:
+        lp |= (1 << 30) | (1 << 31)
+    return lp
+
+
+def _post_key(hwnd, vk, key_up=False):
+    if not hwnd or not user32.IsWindow(hwnd):
+        return
+    msg = WM_KEYUP if key_up else WM_KEYDOWN
+    user32.PostMessageW(hwnd, msg, vk, _key_lparam(vk, key_up=key_up))
+
+
+def _post_click(hwnd, screen_x, screen_y):
+    if not hwnd or not user32.IsWindow(hwnd):
+        return
+    pt = POINT(int(screen_x), int(screen_y))
+    user32.ScreenToClient(hwnd, ctypes.byref(pt))
+    lp = (pt.y << 16) | (pt.x & 0xFFFF)
+    user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, lp)
+    user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp)
+    time.sleep(0.03)
+    user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lp)
+
+
+def get_window_title(hwnd):
+    length = user32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value
+
+
+def get_process_name_from_hwnd(hwnd):
+    pid = ctypes.c_ulong(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return "?"
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not handle:
+        return f"pid:{pid.value}"
+    try:
+        size = ctypes.c_ulong(1024)
+        buf = ctypes.create_unicode_buffer(1024)
+        QueryFullProcessImageNameW = kernel32.QueryFullProcessImageNameW
+        QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong),
+        ]
+        QueryFullProcessImageNameW.restype = ctypes.c_bool
+        if QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return os.path.splitext(os.path.basename(buf.value))[0]
+        return f"pid:{pid.value}"
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def is_user_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def enum_windows():
+    """보이는 top-level 창 목록 [(hwnd, title, process_name), ...]."""
+    windows = []
+
+    def callback(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = get_window_title(hwnd)
+        if not title.strip():
+            return True
+        try:
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        except Exception:
+            ex = 0
+        if ex & WS_EX_TOOLWINDOW:
+            return True
+        if "자동 낚시 봇" in title:
+            return True
+        proc = get_process_name_from_hwnd(hwnd)
+        windows.append((int(hwnd), title, proc))
+        return True
+
+    user32.EnumWindows(EnumWindowsProc(callback), 0)
+    windows.sort(key=lambda x: (x[2].lower(), x[1].lower()))
+    return windows
+
+
+def find_nte_window():
+    """HTGame / 제목 NTE 창 우선 탐색."""
+    candidates = []
+    for hwnd, title, proc in enum_windows():
+        proc_l = (proc or "").lower()
+        title_s = (title or "").strip()
+        if proc_l == "htgame":
+            candidates.append((0, hwnd, title, proc))
+        elif title_s.upper() == "NTE" or title_s.upper().startswith("NTE"):
+            candidates.append((1, hwnd, title, proc))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    _, hwnd, title, proc = candidates[0]
+    return hwnd, title, proc
+
+
+def find_hwnd_by_title(title):
+    if not title:
+        return None
+    for hwnd, t, _proc in enum_windows():
+        if t == title:
+            return hwnd
+    for hwnd, t, _proc in enum_windows():
+        if title in t or t in title:
+            return hwnd
+    return None
+
+
+def resolve_target_hwnd():
+    """hwnd 유효성 검사 후 제목/프로세스로 재연결."""
+    global target_hwnd, target_window_title, target_process_name
+    if target_hwnd and user32.IsWindow(target_hwnd):
+        return target_hwnd
+    if target_window_title:
+        found = find_hwnd_by_title(target_window_title)
+        if found:
+            target_hwnd = found
+            return target_hwnd
+    if target_process_name:
+        for hwnd, title, proc in enum_windows():
+            if proc.lower() == target_process_name.lower():
+                target_hwnd = hwnd
+                target_window_title = title
+                return target_hwnd
+    # NTE 자동 재탐색
+    nte = find_nte_window()
+    if nte:
+        target_hwnd, target_window_title, target_process_name = nte
+        return target_hwnd
+    target_hwnd = None
+    return None
+
+
+def set_target_window(hwnd, title, proc=""):
+    global target_hwnd, target_window_title, target_process_name
+    target_hwnd = int(hwnd)
+    target_window_title = title
+    target_process_name = proc or get_process_name_from_hwnd(hwnd)
+    short = title if len(title) <= 40 else title[:37] + "..."
+    label = f"실행 창: [{target_process_name}] {short}"
+    try:
+        target_window_label.config(text=label, fg="#0066aa")
+    except Exception:
+        pass
+
+
+def auto_select_nte_window():
+    """HTGame(NTE) 창 자동 선택."""
+    global target_hwnd, target_window_title, target_process_name
+    if is_running:
+        messagebox.showinfo("안내", "실행 중에는 창을 변경할 수 없습니다.")
+        return False
+    found = find_nte_window()
+    if not found:
+        messagebox.showwarning(
+            "경고",
+            "HTGame(NTE) 창을 찾지 못했습니다.\n게임이 실행 중인지 확인한 뒤 다시 시도하세요.",
+        )
+        return False
+    hwnd, title, proc = found
+    set_target_window(hwnd, title, proc)
+    messagebox.showinfo("선택됨", f"실행 창: [{proc}] {title}")
+    return True
+
+
+def activate_target_window(hwnd=None):
+    """대상 창을 최전면·포커스로."""
+    hwnd = hwnd or resolve_target_hwnd()
+    if not hwnd or not user32.IsWindow(hwnd):
+        return False
+
+    user32.ShowWindow(hwnd, SW_RESTORE)
+    fg = user32.GetForegroundWindow()
+    cur_tid = kernel32.GetCurrentThreadId()
+    fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+
+    attached_fg = False
+    attached_tg = False
+    try:
+        if fg and fg_tid and fg_tid != cur_tid:
+            attached_fg = bool(user32.AttachThreadInput(cur_tid, fg_tid, True))
+        if target_tid and target_tid != cur_tid:
+            attached_tg = bool(user32.AttachThreadInput(cur_tid, target_tid, True))
+
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        try:
+            user32.SetActiveWindow(hwnd)
+        except Exception:
+            pass
+        try:
+            user32.SetFocus(hwnd)
+        except Exception:
+            pass
+    finally:
+        if attached_tg:
+            user32.AttachThreadInput(cur_tid, target_tid, False)
+        if attached_fg:
+            user32.AttachThreadInput(cur_tid, fg_tid, False)
+
+    return True
+
+
+def ensure_foreground(force=False, min_interval=0.0):
+    """포그라운드가 실행 창이 아니면 다시 활성화."""
+    global _last_ensure_fg
+    now = time.time()
+    if not force and min_interval > 0 and (now - _last_ensure_fg) < min_interval:
+        return
+    hwnd = resolve_target_hwnd()
+    if not hwnd:
+        return
+    if force or user32.GetForegroundWindow() != hwnd:
+        activate_target_window(hwnd)
+    _last_ensure_fg = now
+
+
+def set_bot_topmost(enabled):
+    try:
+        if root.winfo_exists():
+            root.attributes("-topmost", bool(enabled))
+    except tk.TclError:
+        pass
+
+
+def hide_bot_window():
+    """실행 중 봇이 포커스를 뺏지 않도록 숨김."""
+    global bot_withdrawn
+    try:
+        set_bot_topmost(False)
+        root.withdraw()
+        bot_withdrawn = True
+    except tk.TclError:
+        pass
+
+
+def show_bot_window():
+    global bot_withdrawn
+    try:
+        root.deiconify()
+        set_bot_topmost(bot_topmost_default)
+        bot_withdrawn = False
+    except tk.TclError:
+        pass
+
+
+def _pydi_key_name(name):
+    key = name.lower()
+    if key in ("escape", "esc"):
+        return "esc"
+    return key
+
+
 def press_key(name):
     key = name.lower()
     vk = VK_MAP.get(key)
-    if vk is None:
-        return
-    _send_input(_make_key_input(vk, key_up=False))
-    if key in _key_down_state:
-        _key_down_state[key] = True
+    state_key = "esc" if key in ("esc", "escape") else key
+    already = _key_down_state.get(state_key, False)
+    if not already:
+        ensure_foreground()
+
+    sent = False
+    if HAS_PYDIRECTINPUT:
+        try:
+            pydirectinput.keyDown(_pydi_key_name(name))
+            sent = True
+        except Exception:
+            sent = False
+    if not sent and vk is not None:
+        _send_input(_make_key_input(vk, key_up=False))
+        hwnd = resolve_target_hwnd()
+        if hwnd:
+            _post_key(hwnd, vk, key_up=False)
+
+    if state_key in _key_down_state:
+        _key_down_state[state_key] = True
 
 
 def release_key(name):
     key = name.lower()
     vk = VK_MAP.get(key)
-    if vk is None:
-        return
-    _send_input(_make_key_input(vk, key_up=True))
-    if key in _key_down_state:
-        _key_down_state[key] = False
+    state_key = "esc" if key in ("esc", "escape") else key
+    was_down = _key_down_state.get(state_key, False)
+    if was_down:
+        ensure_foreground()
+
+    sent = False
+    if HAS_PYDIRECTINPUT:
+        try:
+            pydirectinput.keyUp(_pydi_key_name(name))
+            sent = True
+        except Exception:
+            sent = False
+    if not sent and vk is not None:
+        _send_input(_make_key_input(vk, key_up=True))
+        hwnd = resolve_target_hwnd()
+        if hwnd:
+            _post_key(hwnd, vk, key_up=True)
+
+    if state_key in _key_down_state:
+        _key_down_state[state_key] = False
 
 
 def tap_key(name):
-    press_key(name)
-    time.sleep(0.04)
-    release_key(name)
+    ensure_foreground(force=True)
+    state_key = "esc" if name.lower() in ("esc", "escape") else name.lower()
+    vk = VK_MAP.get(name.lower())
+
+    sent = False
+    if HAS_PYDIRECTINPUT:
+        try:
+            pydirectinput.press(_pydi_key_name(name))
+            sent = True
+        except Exception:
+            sent = False
+    if not sent and vk is not None:
+        _send_input(_make_key_input(vk, key_up=False))
+        hwnd = resolve_target_hwnd()
+        if hwnd:
+            _post_key(hwnd, vk, key_up=False)
+        time.sleep(0.04)
+        _send_input(_make_key_input(vk, key_up=True))
+        if hwnd:
+            _post_key(hwnd, vk, key_up=True)
+
+    if state_key in _key_down_state:
+        _key_down_state[state_key] = False
 
 
 def release_ad():
@@ -228,14 +589,31 @@ def _make_mouse_input(dx, dy, flags):
 
 
 def click_at(x, y):
-    """화면 절대 좌표에 SendInput 좌클릭."""
-    ax, ay = _to_absolute_mouse(int(x), int(y))
-    flags_move = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
-    _send_input(_make_mouse_input(ax, ay, flags_move))
-    time.sleep(0.03)
-    _send_input(_make_mouse_input(0, 0, MOUSEEVENTF_LEFTDOWN))
-    time.sleep(0.04)
-    _send_input(_make_mouse_input(0, 0, MOUSEEVENTF_LEFTUP))
+    """PyDirectInput 우선, 실패 시 SendInput + PostMessage."""
+    ensure_foreground(force=True)
+    sx, sy = int(x), int(y)
+
+    sent = False
+    if HAS_PYDIRECTINPUT:
+        try:
+            pydirectinput.moveTo(sx, sy)
+            time.sleep(0.03)
+            pydirectinput.click(sx, sy)
+            sent = True
+        except Exception:
+            sent = False
+
+    if not sent:
+        ax, ay = _to_absolute_mouse(sx, sy)
+        flags_move = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+        _send_input(_make_mouse_input(ax, ay, flags_move))
+        time.sleep(0.03)
+        _send_input(_make_mouse_input(0, 0, MOUSEEVENTF_LEFTDOWN))
+        time.sleep(0.04)
+        _send_input(_make_mouse_input(0, 0, MOUSEEVENTF_LEFTUP))
+        hwnd = resolve_target_hwnd()
+        if hwnd:
+            _post_click(hwnd, sx, sy)
 
 
 def get_mouse_state():
@@ -290,35 +668,45 @@ def ensure_template_dir():
 
 
 def load_templates():
-    """디스크에서 템플릿 로드."""
-    global mint_template, yellow_template
-    mint_template = None
-    yellow_template = None
-    if os.path.isfile(MINT_TEMPLATE_PATH):
-        img = cv2.imread(MINT_TEMPLATE_PATH, cv2.IMREAD_COLOR)
-        if img is not None and img.size > 0:
-            mint_template = img
-    if os.path.isfile(YELLOW_TEMPLATE_PATH):
-        img = cv2.imread(YELLOW_TEMPLATE_PATH, cv2.IMREAD_COLOR)
-        if img is not None and img.size > 0:
-            yellow_template = img
-
-
-def save_template(name, bgr_img):
+    """mint*.png / yellow*.png 모두 로드 (긴·짧은 민트 지원)."""
+    global mint_templates, yellow_templates
+    mint_templates = []
+    yellow_templates = []
     ensure_template_dir()
-    path = MINT_TEMPLATE_PATH if name == "mint" else YELLOW_TEMPLATE_PATH
+    if not os.path.isdir(TEMPLATE_DIR):
+        return
+    for fname in sorted(os.listdir(TEMPLATE_DIR)):
+        low = fname.lower()
+        if not low.endswith((".png", ".jpg", ".jpeg", ".bmp")):
+            continue
+        path = os.path.join(TEMPLATE_DIR, fname)
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None or img.size == 0:
+            continue
+        if low.startswith("mint"):
+            mint_templates.append((fname, img))
+        elif low.startswith("yellow"):
+            yellow_templates.append((fname, img))
+
+
+def save_template(kind, bgr_img):
+    ensure_template_dir()
+    path = TEMPLATE_SAVE_PATHS.get(kind)
+    if path is None:
+        path = os.path.join(TEMPLATE_DIR, f"{kind}.png")
     cv2.imwrite(path, bgr_img)
     load_templates()
 
 
 def templates_ready():
-    return mint_template is not None and yellow_template is not None
+    return len(mint_templates) > 0 and len(yellow_templates) > 0
 
 
 def match_template(frame_bgr, template, thresh):
     """
     템플릿 매칭. 성공 시 (center_x, score, box) / 실패 시 (None, score, None)
     box = (x, y, w, h)
+    thresh < 0 이면 점수만 보고 좌표는 항상 반환.
     """
     if template is None or frame_bgr is None:
         return None, 0.0, None
@@ -330,11 +718,38 @@ def match_template(frame_bgr, template, thresh):
     res = cv2.matchTemplate(frame_bgr, template, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
     score = float(max_val)
-    if score < thresh:
-        return None, score, None
     x, y = max_loc
     cx = x + tw // 2
-    return cx, score, (x, y, tw, th)
+    box = (x, y, tw, th)
+    if thresh >= 0 and score < thresh:
+        return None, score, None
+    return cx, score, box
+
+
+def match_best_template(frame_bgr, templates, thresh):
+    """
+    여러 템플릿(긴/짧은 민트 등) 중 점수가 가장 높은 것을 선택.
+    반환: (center_x, score, box, matched_name)
+    """
+    if not templates:
+        return None, 0.0, None, None
+
+    best_score = -1.0
+    best_cx = None
+    best_box = None
+    best_name = None
+
+    for name, tpl in templates:
+        cx, score, box = match_template(frame_bgr, tpl, -1.0)
+        if score > best_score:
+            best_score = score
+            best_cx = cx
+            best_box = box
+            best_name = name
+
+    if best_score < thresh:
+        return None, best_score, None, best_name
+    return best_cx, best_score, best_box, best_name
 
 
 def apply_key_control(mint_x, yellow_x):
@@ -385,7 +800,7 @@ def tk_region_to_mss(left, top, right, bottom):
 
 def build_preview_frame(
     img_bgr, mint_x, yellow_x, mint_score, yellow_score,
-    mint_box, yellow_box, key_state, thresh,
+    mint_box, yellow_box, key_state, thresh, mint_name=None,
 ):
     """캡처 + 템플릿 매칭 박스/점수 미리보기."""
     view = img_bgr.copy()
@@ -408,9 +823,13 @@ def build_preview_frame(
 
     bar = np.zeros((44, view.shape[1], 3), dtype=np.uint8)
     bar[:] = (30, 30, 30)
-    line1 = f"Mint:{mint_x} ({mint_score:.2f})  Yellow:{yellow_x} ({yellow_score:.2f})  thr:{thresh:.2f}"
+    mint_tag = mint_name if mint_name else "-"
+    line1 = (
+        f"Mint:{mint_x} ({mint_score:.2f}) [{mint_tag}]  "
+        f"Yellow:{yellow_x} ({yellow_score:.2f})  thr:{thresh:.2f}"
+    )
     line2 = f"Key:{key_state}  size:{w}x{h}"
-    cv2.putText(bar, line1, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 180), 1, cv2.LINE_AA)
+    cv2.putText(bar, line1, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 180), 1, cv2.LINE_AA)
     cv2.putText(bar, line2, (6, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
     return np.vstack((bar, view))
 
@@ -420,6 +839,7 @@ def capture_loop():
     global is_previewing, preview_bgr
     global last_key_state, last_mint_x, last_yellow_x
     global last_mint_score, last_yellow_score, last_mint_box, last_yellow_box
+    global last_mint_name
 
     with mss.MSS() as sct:
         while is_previewing and custom_monitor is not None:
@@ -432,10 +852,15 @@ def capture_loop():
             img_bgr = cv2.cvtColor(screen, cv2.COLOR_BGRA2BGR)
             thresh = match_threshold
 
-            mint_x, mint_score, mint_box = match_template(img_bgr, mint_template, thresh)
-            yellow_x, yellow_score, yellow_box = match_template(img_bgr, yellow_template, thresh)
+            mint_x, mint_score, mint_box, mint_name = match_best_template(
+                img_bgr, mint_templates, thresh
+            )
+            yellow_x, yellow_score, yellow_box, _yn = match_best_template(
+                img_bgr, yellow_templates, thresh
+            )
 
             if fish_active:
+                ensure_foreground(min_interval=1.0)
                 key_state = apply_key_control(mint_x, yellow_x)
             else:
                 release_ad()
@@ -443,7 +868,7 @@ def capture_loop():
 
             frame = build_preview_frame(
                 img_bgr, mint_x, yellow_x, mint_score, yellow_score,
-                mint_box, yellow_box, key_state, thresh,
+                mint_box, yellow_box, key_state, thresh, mint_name,
             )
 
             with preview_lock:
@@ -455,6 +880,7 @@ def capture_loop():
                 last_yellow_score = yellow_score
                 last_mint_box = mint_box
                 last_yellow_box = yellow_box
+                last_mint_name = mint_name
 
             time.sleep(0.02)
 
@@ -571,6 +997,168 @@ def algorithm_loop():
     release_ad()
     set_algo_status("정지됨")
     is_running = False
+    try:
+        root.after(0, show_bot_window)
+        root.after(0, _update_status_stopped)
+    except Exception:
+        pass
+
+
+def _update_status_stopped():
+    if custom_monitor:
+        status_label.config(text="상태: 정지됨 (미리보기 유지)", fg="red")
+    else:
+        status_label.config(text="상태: 정지됨", fg="red")
+
+
+def select_target_window_dialog():
+    """실행할 창을 리스트에서 선택."""
+    if is_running:
+        messagebox.showinfo("안내", "실행 중에는 창을 변경할 수 없습니다.")
+        return
+
+    windows = enum_windows()
+    if not windows:
+        messagebox.showwarning("경고", "선택 가능한 창이 없습니다.")
+        return
+
+    dlg = tk.Toplevel(root)
+    dlg.title("실행 창 선택")
+    dlg.attributes("-topmost", True)
+    dlg.geometry("560x400")
+    dlg.transient(root)
+    dlg.grab_set()
+
+    tk.Label(
+        dlg,
+        text="NTE는 [HTGame] 제목 NTE 창을 선택하세요",
+        font=("맑은 고딕", 10),
+    ).pack(pady=8)
+
+    listbox = tk.Listbox(dlg, font=("Consolas", 9), exportselection=False)
+    listbox.pack(fill="both", expand=True, padx=10, pady=4)
+    for hwnd, title, proc in windows:
+        listbox.insert(tk.END, f"[{proc}] {title}")
+
+    # HTGame / 이전 선택 하이라이트
+    prefer = -1
+    for i, (_h, t, proc) in enumerate(windows):
+        if proc.lower() == "htgame" or t.strip().upper() == "NTE":
+            prefer = i
+            break
+    if prefer < 0 and target_window_title:
+        for i, (_h, t, _p) in enumerate(windows):
+            if t == target_window_title:
+                prefer = i
+                break
+    if prefer >= 0:
+        listbox.selection_set(prefer)
+        listbox.see(prefer)
+
+    def close():
+        try:
+            dlg.grab_release()
+        except tk.TclError:
+            pass
+        dlg.destroy()
+
+    def confirm():
+        sel = listbox.curselection()
+        if not sel:
+            messagebox.showinfo("안내", "창을 선택해주세요.", parent=dlg)
+            return
+        hwnd, title, proc = windows[sel[0]]
+        set_target_window(hwnd, title, proc)
+        close()
+
+    def pick_nte():
+        found = find_nte_window()
+        if not found:
+            messagebox.showwarning("경고", "HTGame(NTE) 창을 찾지 못했습니다.", parent=dlg)
+            return
+        hwnd, title, proc = found
+        set_target_window(hwnd, title, proc)
+        close()
+
+    btn_row = tk.Frame(dlg)
+    btn_row.pack(pady=8)
+    tk.Button(btn_row, text="NTE 자동 선택", width=14, command=pick_nte).pack(side="left", padx=4)
+    tk.Button(btn_row, text="선택", width=10, command=confirm).pack(side="left", padx=4)
+    tk.Button(btn_row, text="취소", width=10, command=close).pack(side="left", padx=4)
+    listbox.bind("<Double-Button-1>", lambda _e: confirm())
+
+
+def start_macro():
+    global is_running
+    if is_running:
+        return
+    if not algorithm_steps:
+        messagebox.showerror("오류", "알고리즘 단계가 없습니다.")
+        return
+
+    if not is_user_admin():
+        cont = messagebox.askyesno(
+            "관리자 권한 권장",
+            "현재 봇이 관리자 권한으로 실행되지 않았습니다.\n"
+            "NTE는 관리자 실행이 필요할 수 있습니다.\n\n"
+            "그래도 계속할까요?\n(권장: 관리자 PowerShell에서 다시 실행)",
+        )
+        if not cont:
+            return
+
+    hwnd = resolve_target_hwnd()
+    if not hwnd:
+        # 자동으로 NTE 한 번 시도
+        found = find_nte_window()
+        if found:
+            set_target_window(*found)
+            hwnd = found[0]
+    if not hwnd:
+        messagebox.showerror(
+            "오류",
+            "실행 창이 없습니다.\n[NTE 자동 선택] 또는 [실행 창 선택]으로 HTGame 창을 지정하세요.",
+        )
+        return
+
+    has_fish = any(s["type"] == "fish" for s in algorithm_steps)
+    if has_fish:
+        if custom_monitor is None:
+            messagebox.showerror("오류", "fish 단계: 캡처 영역이 필요합니다.")
+            return
+        if not templates_ready():
+            messagebox.showerror("오류", "fish 단계: 민트/노랑 템플릿이 필요합니다.")
+            return
+        if not is_previewing:
+            start_preview()
+
+    # 봇 숨김 + 게임 창 활성화
+    hide_bot_window()
+    activate_target_window(hwnd)
+    time.sleep(0.45)
+
+    backend = "PyDirectInput" if HAS_PYDIRECTINPUT else "SendInput"
+    is_running = True
+    set_algo_status(f"시퀀스 시작 ({backend}, 창 활성화)")
+    try:
+        # withdraw 상태라 status_label 갱신은 정지 후 보임
+        pass
+    except Exception:
+        pass
+    threading.Thread(target=algorithm_loop, daemon=True).start()
+
+
+def stop_macro():
+    global is_running, fish_active, current_step_index
+    is_running = False
+    fish_active = False
+    current_step_index = None
+    release_ad()
+    set_algo_status("정지됨")
+    show_bot_window()
+    if custom_monitor:
+        status_label.config(text="상태: 정지됨 (미리보기 유지)", fg="red")
+    else:
+        status_label.config(text="상태: 정지됨", fg="red")
 
 
 def update_gui_preview():
@@ -614,10 +1202,14 @@ def update_gui_preview():
             )
         )
 
-    mint_status = "OK" if mint_template is not None else "없음"
-    yellow_status = "OK" if yellow_template is not None else "없음"
+    mint_status = f"{len(mint_templates)}개" if mint_templates else "없음"
+    yellow_status = f"{len(yellow_templates)}개" if yellow_templates else "없음"
+    matched = last_mint_name if last_mint_name else "-"
     template_status_label.config(
-        text=f"템플릿  민트:{mint_status}  노랑:{yellow_status}  임계값:{match_threshold:.2f}"
+        text=(
+            f"템플릿  민트:{mint_status}  노랑:{yellow_status}  "
+            f"임계값:{match_threshold:.2f}  현재민트:{matched}"
+        )
     )
 
     mx, my, lmb, rmb, mmb = get_mouse_state()
@@ -666,6 +1258,10 @@ def update_gui_preview():
                     algo_listbox.see(current_step_index)
         except tk.TclError:
             pass
+
+    # 봇 창이 숨겨진 동안 F8로 정지
+    if is_running and (user32.GetAsyncKeyState(0x77) & 0x0001):
+        stop_macro()
 
     root.after(33, update_gui_preview)
 
@@ -832,16 +1428,22 @@ def select_capture_area():
 
 
 def capture_template(kind):
-    """kind: 'mint' | 'yellow' — 화면에서 템플릿 조각 캡처."""
+    """kind: mint_long | mint_short | yellow — 화면에서 템플릿 조각 캡처."""
     if is_running:
         messagebox.showinfo("안내", "실행 중에는 템플릿을 캡처할 수 없습니다.")
         return
 
-    label = "민트" if kind == "mint" else "노랑"
+    labels = {
+        "mint_long": "민트(긴 바)",
+        "mint_short": "민트(짧은 바)",
+        "mint": "민트",
+        "yellow": "노랑",
+    }
+    label = labels.get(kind, kind)
     was_previewing = is_previewing
     stop_preview()
 
-    region = _select_region_modal(f"{label} 바 조각을 작게 드래그해 템플릿으로 저장하세요")
+    region = _select_region_modal(f"{label} 조각을 작게 드래그해 템플릿으로 저장하세요")
     if region is None:
         if was_previewing and custom_monitor is not None:
             start_preview()
@@ -857,10 +1459,12 @@ def capture_template(kind):
         return
 
     save_template(kind, img_bgr)
+    path = TEMPLATE_SAVE_PATHS.get(kind, f"{kind}.png")
     messagebox.showinfo(
         "저장됨",
-        f"{label} 템플릿 저장: {os.path.basename(MINT_TEMPLATE_PATH if kind == 'mint' else YELLOW_TEMPLATE_PATH)}\n"
-        f"크기: {img_bgr.shape[1]}x{img_bgr.shape[0]}",
+        f"{label} 템플릿 저장: {os.path.basename(path)}\n"
+        f"크기: {img_bgr.shape[1]}x{img_bgr.shape[0]}\n"
+        f"민트 템플릿 {len(mint_templates)}개 / 노랑 {len(yellow_templates)}개 로드됨",
     )
     if custom_monitor is not None:
         start_preview()
@@ -981,47 +1585,6 @@ def move_step(delta):
     refresh_algo_list(new_idx)
 
 
-def start_macro():
-    global is_running
-    if is_running:
-        return
-    if not algorithm_steps:
-        messagebox.showerror("오류", "알고리즘 단계가 없습니다.")
-        return
-
-    has_fish = any(s["type"] == "fish" for s in algorithm_steps)
-    if has_fish:
-        if custom_monitor is None:
-            messagebox.showerror("오류", "fish 단계: 캡처 영역이 필요합니다.")
-            return
-        if not templates_ready():
-            messagebox.showerror("오류", "fish 단계: 민트/노랑 템플릿이 필요합니다.")
-            return
-        if not is_previewing:
-            start_preview()
-
-    is_running = True
-    set_algo_status("시퀀스 시작")
-    status_label.config(
-        text="상태: 실행 중 (입력이 안 되면 관리자 권한으로 실행)",
-        fg="green",
-    )
-    threading.Thread(target=algorithm_loop, daemon=True).start()
-
-
-def stop_macro():
-    global is_running, fish_active, current_step_index
-    is_running = False
-    fish_active = False
-    current_step_index = None
-    release_ad()
-    set_algo_status("정지됨")
-    if custom_monitor:
-        status_label.config(text="상태: 정지됨 (미리보기 유지)", fg="red")
-    else:
-        status_label.config(text="상태: 정지됨", fg="red")
-
-
 def on_closing():
     stop_macro()
     stop_preview()
@@ -1031,19 +1594,46 @@ def on_closing():
 # GUI
 root = tk.Tk()
 root.title("자동 낚시 봇")
-root.geometry("620x920")
+root.geometry("620x960")
 root.attributes("-topmost", True)
-root.minsize(540, 760)
+root.minsize(540, 780)
 
 ensure_template_dir()
 load_templates()
 
 status_label = tk.Label(
     root,
-    text="상태: 캡처 영역·템플릿 설정 필요 (게임 입력은 관리자 실행 권장)",
+    text="상태: 실행 창·캡처·템플릿 설정 필요",
     font=("맑은 고딕", 10),
 )
-status_label.pack(pady=(10, 4))
+status_label.pack(pady=(10, 2))
+
+admin_ok = is_user_admin()
+input_backend = "PyDirectInput" if HAS_PYDIRECTINPUT else "SendInput(폴백)"
+admin_label = tk.Label(
+    root,
+    text=(
+        f"권한: {'관리자 OK' if admin_ok else '일반 (관리자 실행 권장)'}  |  "
+        f"입력: {input_backend}"
+    ),
+    font=("맑은 고딕", 9),
+    fg=("#007700" if admin_ok else "#cc6600"),
+)
+admin_label.pack(pady=(0, 4))
+
+# 실행 창 선택
+win_frame = tk.Frame(root)
+win_frame.pack(fill="x", padx=10, pady=(0, 4))
+target_window_label = tk.Label(
+    win_frame, text="실행 창: (미선택) — NTE는 HTGame 창", font=("맑은 고딕", 9), fg="#888888", anchor="w"
+)
+target_window_label.pack(side="left", fill="x", expand=True)
+tk.Button(
+    win_frame, text="NTE 자동", width=10, command=auto_select_nte_window
+).pack(side="right", padx=2)
+tk.Button(
+    win_frame, text="창 목록", width=10, command=select_target_window_dialog
+).pack(side="right", padx=2)
 
 region_info_label = tk.Label(
     root, text="캡처 영역: 미지정", font=("맑은 고딕", 9), fg="#444444"
@@ -1069,11 +1659,15 @@ tpl_frame.pack(fill="x", padx=10, pady=(0, 6))
 tpl_btn_row = tk.Frame(tpl_frame)
 tpl_btn_row.pack(fill="x")
 tk.Button(
-    tpl_btn_row, text="민트 템플릿 캡처", width=16,
-    command=lambda: capture_template("mint"),
+    tpl_btn_row, text="민트(긴) 캡처", width=14,
+    command=lambda: capture_template("mint_long"),
 ).pack(side="left", padx=2)
 tk.Button(
-    tpl_btn_row, text="노랑 템플릿 캡처", width=16,
+    tpl_btn_row, text="민트(짧은) 캡처", width=14,
+    command=lambda: capture_template("mint_short"),
+).pack(side="left", padx=2)
+tk.Button(
+    tpl_btn_row, text="노랑 캡처", width=12,
     command=lambda: capture_template("yellow"),
 ).pack(side="left", padx=2)
 
@@ -1170,7 +1764,7 @@ tk.Button(btn_row, text="정지 (Stop)", command=stop_macro, width=14).grid(row=
 
 hint_label = tk.Label(
     root,
-    text="템플릿 매칭 + SendInput  |  마우스=십자가 중심 클릭  |  입력 실패 시 관리자 실행",
+    text="NTE=HTGame  |  관리자 실행 권장  |  시작 시 봇 숨김, 정지=F8 또는 정지 버튼",
     font=("맑은 고딕", 8),
     fg="#666666",
 )
