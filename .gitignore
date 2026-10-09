@@ -1,0 +1,9 @@
+# 가상환경 (PC마다 run_nte_fishing.bat이 자동 생성)
+venv/
+
+# Python 캐시
+__pycache__/
+*.pyc
+
+# 바로가기 (절대 경로가 들어 있어 PC마다 create_shortcut.ps1로 생성)
+*.lnk
